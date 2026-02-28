@@ -21,9 +21,12 @@ References:
 """
 
 import numpy as np
+import logging
 from scipy.stats import t as t_dist, invgamma, norm
 from scipy.special import gammaln
 import json
+
+logger = logging.getLogger(__name__)
 
 
 class NormalInverseGamma:
@@ -47,6 +50,11 @@ class NormalInverseGamma:
         self.beta = float(max(beta0, 0.01))
         self.n_updates = 0
         self._update_history = []
+        # Store original prior for Savage-Dickey Bayes Factor
+        self._prior_mu0 = self.mu
+        self._prior_kappa0 = self.kappa
+        self._prior_alpha0 = self.alpha
+        self._prior_beta0 = self.beta
 
     def update(self, data: np.ndarray) -> dict:
         """
@@ -307,6 +315,9 @@ class BayesianParameterTracker:
 
         BF₀₁ = p(μ = h | data) / p(μ = h | prior)
 
+        Prior marginal:     μ ~ t_{2α₀}(μ₀, β₀/(α₀·κ₀))
+        Posterior marginal: μ ~ t_{2αₙ}(μₙ, βₙ/(αₙ·κₙ))
+
         BF > 3: substantial evidence for H₀
         BF < 1/3: substantial evidence against H₀
         """
@@ -315,17 +326,21 @@ class BayesianParameterTracker:
 
         nig = self.posteriors[param]
 
-        # Posterior density at hypothesis value
+        # Posterior marginal density: μ | data ~ t_{2αₙ}(μₙ, βₙ/(αₙ·κₙ))
         df_post = 2.0 * nig.alpha
         scale_post = np.sqrt(nig.beta / (nig.alpha * nig.kappa))
         posterior_density = t_dist.pdf(hypothesis_value, df_post,
                                        loc=nig.mu, scale=scale_post)
 
-        # Use a diffuse prior density as reference
-        prior_density = norm.pdf(hypothesis_value, loc=nig.mu, scale=scale_post * 10)
-        prior_density = max(prior_density, 1e-10)
+        # TRUE prior marginal density: μ ~ t_{2α₀}(μ₀, β₀/(α₀·κ₀))
+        df_prior = 2.0 * nig._prior_alpha0
+        scale_prior = np.sqrt(nig._prior_beta0 / (nig._prior_alpha0 * nig._prior_kappa0))
+        prior_density = t_dist.pdf(hypothesis_value, df_prior,
+                                    loc=nig._prior_mu0, scale=scale_prior)
+        prior_density = max(prior_density, 1e-30)
 
         bf = posterior_density / prior_density
+        bf = max(bf, 1e-30)  # prevent log(0)
 
         if bf > 10:
             interpretation = "strong evidence FOR hypothesis"
@@ -343,4 +358,12 @@ class BayesianParameterTracker:
             "log_bf": round(float(np.log(bf)), 4),
             "interpretation": interpretation,
             "hypothesis_value": hypothesis_value,
+            "prior_params": {
+                "mu0": nig._prior_mu0, "kappa0": nig._prior_kappa0,
+                "alpha0": nig._prior_alpha0, "beta0": nig._prior_beta0,
+            },
+            "posterior_params": {
+                "mu": nig.mu, "kappa": nig.kappa,
+                "alpha": nig.alpha, "beta": nig.beta,
+            },
         }

@@ -20,8 +20,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import numpy as np
 import pandas as pd
+import logging
 import warnings
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=UserWarning, module="lightgbm")
+
+logger = logging.getLogger(__name__)
 
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.core.problem import ElementwiseProblem
@@ -180,9 +183,9 @@ _pareto_F = None
 def _ensure_pareto():
     global _pareto_X, _pareto_F, _pareto_cache
     if _pareto_X is None:
-        print("[BatchMind] Running constrained NSGA-II Pareto optimization...")
+        logger.info("Running constrained NSGA-II Pareto optimization...")
         _pareto_X, _pareto_F = _run_nsga2_pareto(n_gen=100, pop_size=60)
-        print(f"[BatchMind] Pareto front: {len(_pareto_X)} solutions")
+        logger.info(f"Pareto front: {len(_pareto_X)} solutions")
 
         _pareto_cache = []
         for x, f in zip(_pareto_X, _pareto_F):
@@ -428,9 +431,9 @@ def bayesian_update_from_feedback(sig_id: str, param_values: dict) -> dict:
 
 # ─── INIT ────────────────────────────────────────────────────────────────────
 
-print("[BatchMind] Training surrogate models for NSGA-II...")
+logger.info("Training surrogate models for NSGA-II...")
 _train_surrogates()
-print("[BatchMind] Computing constrained NSGA-II Pareto front...")
+logger.info("Computing constrained NSGA-II Pareto front...")
 init_signatures_done = False
 try:
     _ensure_pareto()
@@ -440,6 +443,6 @@ try:
     compute_golden_signature({"quality": 0.3, "yield": 0.3, "energy": 0.3, "performance": 0.1}, "sustainability")
     init_signatures_done = True
 except Exception as e:
-    print(f"[BatchMind] Warning: signature init error: {e}")
+    logger.warning(f"Signature init error: {e}")
 
-print(f"[BatchMind] ✅ Golden Signature ready. {len(_bayesian_trackers)} Bayesian trackers active.")
+logger.info(f"✅ Golden Signature ready. {len(_bayesian_trackers)} Bayesian trackers active.")

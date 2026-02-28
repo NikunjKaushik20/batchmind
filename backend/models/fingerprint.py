@@ -18,8 +18,9 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import interp1d
 from scipy.stats import percentileofscore
+import threading
 import warnings
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=UserWarning, module="tslearn")
 
 from tslearn.metrics import dtw as compute_dtw
 try:
@@ -370,17 +371,409 @@ def compute_anomaly_score(batch_id: str) -> dict:
         ],
     }
 
+_iforest_cache = {}  # {batch_id: dtw_feature_vector} + "_model": IsolationForest
+
+
+def _precompute_iforest_features() -> tuple:
+    """
+    Precompute DTW feature matrix and Isolation Forest model once.
+    This avoids the O(n²) recomputation that was happening inside
+    compute_anomaly_score × get_all_batch_ids.
+
+    Returns (iforest_model, feature_dict) where:
+      - iforest_model: fitted IsolationForest (or None)
+      - feature_dict: {batch_id: dtw_feature_vector}
+    """
+    global _iforest_cache
+    if "_model" in _iforest_cache:
+        return _iforest_cache["_model"], _iforest_cache
+
+    fingerprints = compute_fingerprints()
+    all_ts = load_process_data()
+    batch_ids = get_all_batch_ids()
+
+    all_features = {}
+    feature_matrix = []
+
+    for bid in batch_ids:
+        bid_df = all_ts[all_ts["Batch_ID"] == bid]
+        features = []
+        for phase in PHASES:
+            if phase in fingerprints:
+                c = _extract_phase_curve(bid_df, phase)
+                if c is not None:
+                    dba = np.array(fingerprints[phase]["mean"])
+                    features.append(compute_dtw(c, dba))
+                else:
+                    features.append(0)
+            else:
+                features.append(0)
+        all_features[bid] = features
+        feature_matrix.append(features)
+
+    iforest_model = None
+    if HAS_IFOREST and len(feature_matrix) > 5:
+        try:
+            X = np.array(feature_matrix)
+            iforest_model = IsolationForest(
+                n_estimators=100, contamination=0.1, random_state=42
+            )
+            iforest_model.fit(X)
+        except Exception:
+            pass
+
+    _iforest_cache = all_features
+    _iforest_cache["_model"] = iforest_model
+    return iforest_model, all_features
+
 
 def get_all_anomaly_scores() -> list:
+    """
+    Compute anomaly scores for ALL batches efficiently.
+
+    Performance optimization:
+      - Precomputes DTW feature matrix and Isolation Forest ONCE
+      - Shares computed features across all batch score computations
+      - Reduces DTW computations from O(n² × phases) to O(n × phases)
+    """
+    fingerprints = compute_fingerprints()
+    all_ts = load_process_data()
+    batch_ids = get_all_batch_ids()
+
+    # Precompute Isolation Forest (ONCE, not per-batch)
+    iforest_model, feature_dict = _precompute_iforest_features()
+
     results = []
-    for bid in get_all_batch_ids():
+    for bid in batch_ids:
         try:
-            score = compute_anomaly_score(bid)
+            batch_df = all_ts[all_ts["Batch_ID"] == bid]
+            scores = {}
+            overall_deviations = []
+
+            for phase in PHASES:
+                if phase not in fingerprints:
+                    scores[phase] = {"anomaly_score": 0, "asset_health": 100}
+                    continue
+
+                curve = _extract_phase_curve(batch_df, phase)
+                if curve is None:
+                    scores[phase] = {"anomaly_score": 0, "asset_health": 100}
+                    continue
+
+                fp = fingerprints[phase]
+                dba_curve = np.array(fp["mean"])
+                dtw_distribution = np.array(fp["dtw_to_reference"])
+                dtw_dist = compute_dtw(curve, dba_curve)
+                percentile = float(percentileofscore(dtw_distribution, dtw_dist))
+                anomaly_score = float(np.clip(percentile - 50, 0, 100))
+                overall_deviations.append(anomaly_score)
+
+            overall_health = round(100 - np.mean(overall_deviations), 1) if overall_deviations else 100
+            overall_health = max(0.0, overall_health)
+
+            # Isolation Forest score using PRECOMPUTED model
+            iforest_score = None
+            if iforest_model is not None and bid in feature_dict:
+                try:
+                    query = np.array(feature_dict[bid]).reshape(1, -1)
+                    iforest_score = float(iforest_model.decision_function(query)[0])
+                except Exception:
+                    pass
+
             results.append({
                 "batch_id": bid,
-                "overall_health": score["overall_health"],
-                "isolation_forest_score": score.get("isolation_forest_score"),
+                "overall_health": overall_health,
+                "isolation_forest_score": round(iforest_score, 4) if iforest_score is not None else None,
             })
         except Exception:
             results.append({"batch_id": bid, "overall_health": 85.0})
     return results
+
+
+# ─── ENERGY PATTERN INTELLIGENCE ─────────────────────────────────────────────
+
+def compute_degradation_trend(phase: str = None) -> dict:
+    """
+    Equipment degradation trend detection via exponential fit on DTW distances.
+
+    For each manufacturing phase, fits:
+      DTW(t) = a · exp(b · t) + c
+
+    Where increasing b indicates accelerating degradation.
+    Also computes Remaining Useful Life (RUL) — batches until DTW exceeds
+    the anomaly threshold (95th percentile of historical distribution).
+
+    Returns:
+      - Trend direction per phase (improving/stable/degrading)
+      - Degradation rate coefficient
+      - Estimated RUL in batches
+      - Alert if RUL < 20 batches
+    """
+    from scipy.optimize import curve_fit
+
+    fingerprints = compute_fingerprints()
+    all_ts = load_process_data()
+    batch_ids = get_all_batch_ids()
+
+    phases_to_analyze = [phase] if phase else PHASES
+    results = {}
+
+    for ph in phases_to_analyze:
+        if ph not in fingerprints:
+            continue
+
+        fp = fingerprints[ph]
+        dba_curve = np.array(fp["mean"])
+        dtw_distribution = np.array(fp["dtw_to_reference"])
+
+        # Compute DTW distance to DBA for each batch in order
+        dtw_sequence = []
+        for bid in batch_ids:
+            batch_df = all_ts[all_ts["Batch_ID"] == bid]
+            curve = _extract_phase_curve(batch_df, ph)
+            if curve is not None:
+                dtw_dist = compute_dtw(curve, dba_curve)
+                dtw_sequence.append(float(dtw_dist))
+            else:
+                dtw_sequence.append(None)
+
+        # Remove Nones and track indices
+        valid = [(i, v) for i, v in enumerate(dtw_sequence) if v is not None]
+        if len(valid) < 10:
+            results[ph] = {"trend": "insufficient_data", "n_valid": len(valid)}
+            continue
+
+        t = np.array([v[0] for v in valid], dtype=float)
+        y = np.array([v[1] for v in valid], dtype=float)
+        t_norm = (t - t.min()) / (t.max() - t.min() + 1e-9)
+
+        # Linear trend first (robust)
+        coeffs = np.polyfit(t_norm, y, 1)
+        linear_slope = coeffs[0]
+
+        # Exponential fit: y = a * exp(b * t) + c
+        exp_fit_success = False
+        try:
+            def exp_model(x, a, b, c):
+                return a * np.exp(b * x) + c
+
+            popt, _ = curve_fit(
+                exp_model, t_norm, y,
+                p0=[y.std(), 0.5, y.mean()],
+                bounds=([0, -5, 0], [y.max() * 2, 5, y.max() * 2]),
+                maxfev=3000,
+            )
+            a, b, c = popt
+            y_pred = exp_model(t_norm, *popt)
+            ss_res = np.sum((y - y_pred) ** 2)
+            ss_tot = np.sum((y - y.mean()) ** 2)
+            r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+            exp_fit_success = r2 > 0.1
+        except Exception:
+            a, b, c, r2 = 0, 0, y.mean(), 0
+
+        # Determine trend
+        if exp_fit_success and b > 0.3:
+            trend = "degrading"
+        elif exp_fit_success and b < -0.3:
+            trend = "improving"
+        elif abs(linear_slope) < y.std() * 0.1:
+            trend = "stable"
+        elif linear_slope > 0:
+            trend = "degrading"
+        else:
+            trend = "improving"
+
+        # RUL estimation: when does DTW exceed the anomaly threshold?
+        anomaly_threshold = float(np.percentile(dtw_distribution, 95))
+        current_dtw = y[-1]
+        rul_batches = None
+
+        if exp_fit_success and b > 0.01:
+            # Solve: a * exp(b * t_rul) + c = threshold
+            try:
+                t_rul = np.log((anomaly_threshold - c) / (a + 1e-9)) / (b + 1e-9)
+                rul_batches = max(0, int((t_rul - t_norm[-1]) * len(batch_ids)))
+            except (ValueError, OverflowError):
+                rul_batches = None
+        elif linear_slope > 0.01:
+            # Linear extrapolation
+            remaining = (anomaly_threshold - current_dtw) / (linear_slope + 1e-9)
+            rul_batches = max(0, int(remaining * len(batch_ids)))
+
+        results[ph] = {
+            "trend": trend,
+            "linear_slope": round(float(linear_slope), 4),
+            "exponential_fit": {
+                "a": round(float(a), 4),
+                "b": round(float(b), 4),
+                "c": round(float(c), 4),
+                "r2": round(float(r2), 4),
+                "success": exp_fit_success,
+            } if exp_fit_success else None,
+            "current_dtw": round(float(current_dtw), 4),
+            "anomaly_threshold": round(float(anomaly_threshold), 4),
+            "rul_batches": rul_batches,
+            "alert": rul_batches is not None and rul_batches < 20,
+            "alert_message": (
+                f"Phase '{ph}' equipment predicted to reach anomaly threshold "
+                f"in ~{rul_batches} batches. Schedule preventive maintenance."
+            ) if rul_batches is not None and rul_batches < 20 else None,
+            "dtw_sequence": [round(v, 3) for v in y.tolist()],
+            "n_datapoints": len(y),
+        }
+
+    return {
+        "phases": results,
+        "method": "Exponential degradation fitting on DTW distance sequence",
+        "total_batches_analyzed": len(batch_ids),
+    }
+
+
+def energy_pattern_forecast(phase: str, n_future: int = 5) -> dict:
+    """
+    Forecast next N batches' energy consumption using Holt-Winters exponential smoothing.
+
+    Method:
+      1. Compute per-batch energy (area under power curve) for each historical batch
+      2. Fit Holt-Winters additive model with damped trend (statsmodels)
+      3. Produce point forecasts + prediction intervals from residual distribution
+      4. Also generate curve-level forecasts using DBA + trend-adjusted residual model
+
+    Holt-Winters Exponential Smoothing:
+      Level:   l_t = α·y_t + (1-α)·(l_{t-1} + φ·b_{t-1})
+      Trend:   b_t = β·(l_t - l_{t-1}) + (1-β)·φ·b_{t-1}
+      Forecast: ŷ_{t+h} = l_t + φ·b_t·(1 + φ + ... + φ^{h-1})
+      Damped trend (φ < 1) prevents extrapolation explosion.
+
+    Ref: Hyndman, R.J. & Athanasopoulos, G. (2021). Forecasting: Principles and Practice, 3rd ed.
+    """
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing, SimpleExpSmoothing
+
+    fingerprints = compute_fingerprints()
+    if phase not in fingerprints:
+        return {"error": f"Phase '{phase}' not found"}
+
+    fp = fingerprints[phase]
+    dba_curve = np.array(fp["mean"])
+    all_curves = np.array(fp["all_curves"])
+    n_hist = len(all_curves)
+
+    # ── 1. Compute per-batch energy time-series ──
+    batch_energies = np.array([float(c.sum() / 60.0) for c in all_curves])
+
+    # ── 2. Fit Holt-Winters exponential smoothing ──
+    forecast_energies = []
+    forecast_low = []
+    forecast_high = []
+    hw_params = {}
+    method_used = "insufficient_data"
+
+    if n_hist >= 8:
+        try:
+            # Holt-Winters with damped additive trend (no seasonality — batches are aperiodic)
+            hw_model = ExponentialSmoothing(
+                batch_energies,
+                trend="add",
+                seasonal=None,
+                damped_trend=True,
+                initialization_method="estimated",
+            ).fit(optimized=True)
+
+            # Point forecasts
+            hw_forecast = hw_model.forecast(n_future)
+            forecast_energies = [round(float(v), 3) for v in hw_forecast]
+
+            # Prediction intervals from residual distribution (Gaussian assumption)
+            residuals = hw_model.resid
+            residual_std = float(np.std(residuals))
+            residual_mean = float(np.mean(residuals))
+
+            # Prediction intervals widen with horizon (√h scaling)
+            for h in range(1, n_future + 1):
+                interval_width = 1.645 * residual_std * np.sqrt(h)
+                forecast_low.append(round(float(hw_forecast.iloc[h - 1] - interval_width), 3))
+                forecast_high.append(round(float(hw_forecast.iloc[h - 1] + interval_width), 3))
+
+            hw_params = {
+                "alpha": round(float(hw_model.params.get("smoothing_level", 0)), 4),
+                "beta": round(float(hw_model.params.get("smoothing_trend", 0)), 4),
+                "phi": round(float(hw_model.params.get("damping_trend", 0)), 4),
+                "residual_std": round(residual_std, 4),
+                "residual_mean": round(residual_mean, 4),
+                "aic": round(float(hw_model.aic), 2),
+                "bic": round(float(hw_model.bic), 2),
+            }
+            method_used = "Holt-Winters Exponential Smoothing (damped additive trend)"
+
+        except Exception:
+            # Fallback: Simple exponential smoothing (no trend)
+            try:
+                ses_model = SimpleExpSmoothing(
+                    batch_energies, initialization_method="estimated"
+                ).fit(optimized=True)
+                ses_forecast = ses_model.forecast(n_future)
+                forecast_energies = [round(float(v), 3) for v in ses_forecast]
+                residual_std = float(np.std(ses_model.resid))
+                for h in range(1, n_future + 1):
+                    interval_width = 1.645 * residual_std * np.sqrt(h)
+                    forecast_low.append(round(float(ses_forecast.iloc[h - 1] - interval_width), 3))
+                    forecast_high.append(round(float(ses_forecast.iloc[h - 1] + interval_width), 3))
+                hw_params = {"alpha": round(float(ses_model.params.get("smoothing_level", 0)), 4)}
+                method_used = "Simple Exponential Smoothing (fallback)"
+            except Exception:
+                # Last resort: historical mean
+                mean_e = float(batch_energies.mean())
+                std_e = float(batch_energies.std())
+                forecast_energies = [round(mean_e, 3)] * n_future
+                forecast_low = [round(mean_e - 1.645 * std_e, 3)] * n_future
+                forecast_high = [round(mean_e + 1.645 * std_e, 3)] * n_future
+                method_used = "Historical mean (fallback)"
+    else:
+        # Not enough data for exponential smoothing
+        mean_e = float(batch_energies.mean())
+        std_e = float(batch_energies.std()) if n_hist > 1 else 0
+        forecast_energies = [round(mean_e, 3)] * n_future
+        forecast_low = [round(mean_e - 1.645 * std_e, 3)] * n_future
+        forecast_high = [round(mean_e + 1.645 * std_e, 3)] * n_future
+        method_used = "Historical mean (insufficient data for Holt-Winters)"
+
+    # ── 3. Curve-level forecast using DBA + trend-adjusted residual model ──
+    residuals = all_curves - dba_curve
+    residual_mean_curve = residuals.mean(axis=0)
+    residual_std_curve = residuals.std(axis=0)
+
+    # Detect drift in recent curves
+    if n_hist >= 10:
+        recent_residuals = residuals[-5:]
+        earlier_residuals = residuals[:-5]
+        drift = recent_residuals.mean(axis=0) - earlier_residuals.mean(axis=0)
+    else:
+        drift = np.zeros(len(dba_curve))
+
+    curve_forecasts = []
+    for i in range(n_future):
+        noise = np.random.normal(residual_mean_curve, residual_std_curve)
+        forecast_curve = dba_curve + drift * (i + 1) + noise
+        forecast_curve = np.maximum(forecast_curve, 0)
+        curve_forecasts.append(forecast_curve)
+
+    curve_forecasts = np.array(curve_forecasts)
+
+    return {
+        "phase": phase,
+        "n_forecast": n_future,
+        "predicted_energy_kwh": forecast_energies,
+        "prediction_interval_low": forecast_low,
+        "prediction_interval_high": forecast_high,
+        "mean_predicted_energy_kwh": round(float(np.mean(forecast_energies)), 3),
+        "historical_energy_kwh": [round(float(e), 3) for e in batch_energies],
+        "curve_forecast_mean": curve_forecasts.mean(axis=0).tolist(),
+        "curve_forecast_lower_90": np.percentile(curve_forecasts, 5, axis=0).tolist(),
+        "curve_forecast_upper_90": np.percentile(curve_forecasts, 95, axis=0).tolist(),
+        "drift_detected": bool(np.abs(drift).max() > residual_std_curve.mean() * 0.5),
+        "drift_magnitude": round(float(np.abs(drift).mean()), 4),
+        "exponential_smoothing": hw_params,
+        "method": method_used,
+        "n_historical_patterns": n_hist,
+    }

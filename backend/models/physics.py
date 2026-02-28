@@ -23,8 +23,11 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import curve_fit, minimize
 from scipy.stats import pearsonr
+import logging
 import warnings
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+logger = logging.getLogger(__name__)
 
 
 class PharmPhysicsEngine:
@@ -250,11 +253,51 @@ class PharmPhysicsEngine:
             ss_tot = np.sum((dissolution - dissolution.mean()) ** 2)
             r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
             self._calibration_r2["drying"] = round(r2, 4)
-            results["drying_kinetics"] = {"r2": round(r2, 4), "params": {
-                "k0": round(float(popt[0]), 6), "Ea": round(float(popt[1]), 1),
-                "n": round(float(popt[2]), 4), "M0_base": round(float(popt[3]), 4),
-                "binder_coeff": round(float(popt[4]), 4),
-            }}
+
+            # Cross-validation R² for moisture proxy calibration
+            # This quantifies the reliability of the indirect calibration
+            from sklearn.model_selection import KFold
+            cv_r2s = []
+            kf = KFold(n_splits=min(5, len(dt_vals) // 3), shuffle=True, random_state=42)
+            for train_idx, val_idx in kf.split(dt_vals):
+                try:
+                    popt_cv, _ = curve_fit(
+                        drying_dissolution_proxy,
+                        (dt_vals[train_idx], dtime_vals[train_idx], binder_vals[train_idx]),
+                        dissolution[train_idx],
+                        p0=popt, bounds=(
+                            [0.0001, 5000, 0.5, 1.0, 0.05, 0.1, 50],
+                            [0.1, 80000, 3.0, 10.0, 2.0, 20, 110]
+                        ),
+                        maxfev=5000,
+                    )
+                    val_pred = drying_dissolution_proxy(
+                        (dt_vals[val_idx], dtime_vals[val_idx], binder_vals[val_idx]), *popt_cv
+                    )
+                    ss_res_cv = np.sum((dissolution[val_idx] - val_pred) ** 2)
+                    ss_tot_cv = np.sum((dissolution[val_idx] - dissolution[val_idx].mean()) ** 2)
+                    cv_r2s.append(1 - ss_res_cv / ss_tot_cv if ss_tot_cv > 0 else 0)
+                except Exception:
+                    pass
+
+            cv_r2_mean = float(np.mean(cv_r2s)) if cv_r2s else None
+            self._calibration_r2["drying_cv"] = round(cv_r2_mean, 4) if cv_r2_mean else None
+
+            results["drying_kinetics"] = {
+                "r2": round(r2, 4),
+                "cv_r2": round(cv_r2_mean, 4) if cv_r2_mean else None,
+                "calibration_note": (
+                    "Calibrated against Dissolution_Rate as a proxy for moisture content. "
+                    "Higher moisture → lower dissolution. The Page kinetics parameters "
+                    "(k₀, Eₐ, n) are physically meaningful; the proxy mapping "
+                    "(d_slope, d_intercept) accounts for the moisture→dissolution relationship."
+                ),
+                "params": {
+                    "k0": round(float(popt[0]), 6), "Ea": round(float(popt[1]), 1),
+                    "n": round(float(popt[2]), 4), "M0_base": round(float(popt[3]), 4),
+                    "binder_coeff": round(float(popt[4]), 4),
+                },
+            }
         except Exception as e:
             results["drying_kinetics"] = {"error": str(e)}
 
