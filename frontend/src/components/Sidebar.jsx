@@ -38,8 +38,8 @@ export default function Sidebar({ open, onClose }) {
                 <div className="sidebar-footer">
                     <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>
                         <div style={{ fontWeight: 700, color: 'var(--text-secondary)', marginBottom: 4 }}>BatchMind v1.0</div>
-                        IIT Hyderabad Hackathon<br />
-                        AI Manufacturing Track
+                        <br />
+
                     </div>
                 </div>
             </aside>

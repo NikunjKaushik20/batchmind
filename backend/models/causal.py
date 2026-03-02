@@ -200,6 +200,39 @@ def _fit_scm():
     return fit_results
 
 
+# ─── FEATURE ENGINEERING (Physics-Informed) ──────────────────────────────────
+
+def _engineer_features(df_in: pd.DataFrame) -> pd.DataFrame:
+    """
+    Augment base features with physics-based interaction terms.
+    Crucial for capturing non-linear process dynamics (e.g. thermal energy).
+    """
+    df = df_in.copy()
+    
+    # 1. Thermal Energy (Thermodynamics): Temp × Time interaction
+    if "Drying_Temp" in df.columns and "Drying_Time" in df.columns:
+        df["Thermal_Energy"] = df["Drying_Temp"] * df["Drying_Time"]
+    
+    # 2. Granulation Saturation Rate (Fluid Dynamics): Binder / Time
+    if "Binder_Amount" in df.columns and "Granulation_Time" in df.columns:
+        # Avoid division by zero
+        df["Binder_Rate"] = df["Binder_Amount"] / (df["Granulation_Time"] + 1e-5)
+
+    # 3. Compaction Energy (Mechanics): Force × Speed
+    if "Compression_Force" in df.columns and "Machine_Speed" in df.columns:
+        df["Compaction_Energy"] = df["Compression_Force"] * df["Machine_Speed"]
+        
+    # 4. Specific Force (Mechanics): Force² (often related to Tablet Hardness)
+    if "Compression_Force" in df.columns:
+        df["Force_Squared"] = df["Compression_Force"] ** 2
+
+    # 5. Kinetic Energy Factor: Speed² 
+    if "Machine_Speed" in df.columns:
+        df["Speed_Squared"] = df["Machine_Speed"] ** 2
+
+    return df
+
+
 # ─── LIGHTGBM SURROGATE MODELS (for NSGA-II speed) ───────────────────────────
 
 def _train_lgb_models():
@@ -223,13 +256,19 @@ def _train_lgb_models():
     global _shap_values, _scaler, _param_bounds
 
     df = _get_enriched_data()
-    X = df[INPUT_PARAMS]
+    
+    # Apply Physics-based Feature Engineering
+    X_base = df[INPUT_PARAMS]
+    X_augmented = _engineer_features(X_base)
+    
+    # We fit the scaler on the AUGMENTED feature set
     _scaler = StandardScaler()
-    X_scaled = _scaler.fit_transform(X)
-
+    X_scaled = _scaler.fit_transform(X_augmented)
+    
+    # Update bounds (only for base params, used by optimizer)
     _param_bounds = {
-        "lower": X.min().values,
-        "upper": X.max().values,
+        "lower": X_base.min().values,
+        "upper": X_base.max().values,
         "names": INPUT_PARAMS,
     }
 
@@ -248,8 +287,9 @@ def _train_lgb_models():
 
         # ── 1. Production model (trained on ALL data) ──
         model = lgb.LGBMRegressor(
-            n_estimators=200, learning_rate=0.05,
-            num_leaves=15, random_state=42, verbose=-1,
+            n_estimators=300, learning_rate=0.03,
+            num_leaves=20, colsample_bytree=0.8,
+            random_state=42, verbose=-1,
         )
         model.fit(X_scaled, y)
         with _state_lock:
@@ -257,8 +297,9 @@ def _train_lgb_models():
 
         # ── 2. Holdout R² (trained on 80%, evaluated on 20%) ──
         cal_model = lgb.LGBMRegressor(
-            n_estimators=200, learning_rate=0.05,
-            num_leaves=15, random_state=42, verbose=-1,
+            n_estimators=300, learning_rate=0.03,
+            num_leaves=20, colsample_bytree=0.8,
+            random_state=42, verbose=-1,
         )
         cal_model.fit(X_train_s, y_train)
         cal_pred = cal_model.predict(X_cal_s)
@@ -293,9 +334,12 @@ def _train_lgb_models():
         # ── 5. SHAP ──
         explainer = shap.TreeExplainer(model)
         sv = explainer.shap_values(X_scaled)
+        
+        # Map SHAP values back to features (augmented set)
+        feature_names = X_augmented.columns.tolist()
         _shap_values[target] = {
             param: round(float(np.abs(sv[:, i]).mean()), 4)
-            for i, param in enumerate(INPUT_PARAMS)
+            for i, param in enumerate(feature_names)
         }
 
 
@@ -312,7 +356,13 @@ def _predict(x: np.ndarray, target: str) -> float:
     For targets without physics models:
       prediction = ML(x)
     """
-    x_scaled = _scaler.transform(x.reshape(1, -1))
+    # Convert base vector 'x' to DataFrame to apply engineering
+    x_df = pd.DataFrame([x], columns=INPUT_PARAMS)
+    x_aug = _engineer_features(x_df)
+    
+    # Scale using the augment-aware scaler
+    x_scaled = _scaler.transform(x_aug)
+    
     ml_pred = float(_lgb_models[target].predict(x_scaled)[0])
 
     # Physics-ML blending for supported targets

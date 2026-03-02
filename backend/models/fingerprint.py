@@ -376,36 +376,26 @@ _iforest_cache = {}  # {batch_id: dtw_feature_vector} + "_model": IsolationFores
 
 def _precompute_iforest_features() -> tuple:
     """
-    Precompute DTW feature matrix and Isolation Forest model once.
-    This avoids the O(n²) recomputation that was happening inside
-    compute_anomaly_score × get_all_batch_ids.
-
-    Returns (iforest_model, feature_dict) where:
-      - iforest_model: fitted IsolationForest (or None)
-      - feature_dict: {batch_id: dtw_feature_vector}
+    Precompute Isolation Forest using dtw_to_reference from cached fingerprints.
+    No new DTW computations — reuses values already computed in compute_fingerprints().
     """
     global _iforest_cache
     if "_model" in _iforest_cache:
         return _iforest_cache["_model"], _iforest_cache
 
     fingerprints = compute_fingerprints()
-    all_ts = load_process_data()
     batch_ids = get_all_batch_ids()
 
+    # Build feature matrix from CACHED dtw_to_reference (no new DTW calls)
     all_features = {}
     feature_matrix = []
 
-    for bid in batch_ids:
-        bid_df = all_ts[all_ts["Batch_ID"] == bid]
+    for i, bid in enumerate(batch_ids):
         features = []
         for phase in PHASES:
             if phase in fingerprints:
-                c = _extract_phase_curve(bid_df, phase)
-                if c is not None:
-                    dba = np.array(fingerprints[phase]["mean"])
-                    features.append(compute_dtw(c, dba))
-                else:
-                    features.append(0)
+                dtw_dists = fingerprints[phase]["dtw_to_reference"]
+                features.append(float(dtw_dists[i]) if i < len(dtw_dists) else 0)
             else:
                 features.append(0)
         all_features[bid] = features
@@ -429,42 +419,33 @@ def _precompute_iforest_features() -> tuple:
 
 def get_all_anomaly_scores() -> list:
     """
-    Compute anomaly scores for ALL batches efficiently.
-
-    Performance optimization:
-      - Precomputes DTW feature matrix and Isolation Forest ONCE
-      - Shares computed features across all batch score computations
-      - Reduces DTW computations from O(n² × phases) to O(n × phases)
+    Compute anomaly scores for ALL batches using CACHED dtw_to_reference.
+    Zero new DTW computations — all distances reused from compute_fingerprints().
     """
     fingerprints = compute_fingerprints()
-    all_ts = load_process_data()
     batch_ids = get_all_batch_ids()
 
-    # Precompute Isolation Forest (ONCE, not per-batch)
+    # Precompute Isolation Forest (reuses cached DTW distances)
     iforest_model, feature_dict = _precompute_iforest_features()
 
     results = []
-    for bid in batch_ids:
+    for i, bid in enumerate(batch_ids):
         try:
-            batch_df = all_ts[all_ts["Batch_ID"] == bid]
-            scores = {}
             overall_deviations = []
 
             for phase in PHASES:
                 if phase not in fingerprints:
-                    scores[phase] = {"anomaly_score": 0, "asset_health": 100}
-                    continue
-
-                curve = _extract_phase_curve(batch_df, phase)
-                if curve is None:
-                    scores[phase] = {"anomaly_score": 0, "asset_health": 100}
                     continue
 
                 fp = fingerprints[phase]
-                dba_curve = np.array(fp["mean"])
-                dtw_distribution = np.array(fp["dtw_to_reference"])
-                dtw_dist = compute_dtw(curve, dba_curve)
-                percentile = float(percentileofscore(dtw_distribution, dtw_dist))
+                dtw_dists = np.array(fp["dtw_to_reference"])
+
+                if i >= len(dtw_dists):
+                    continue
+
+                # Reuse cached DTW distance instead of recomputing
+                dtw_dist = float(dtw_dists[i])
+                percentile = float(percentileofscore(dtw_dists, dtw_dist))
                 anomaly_score = float(np.clip(percentile - 50, 0, 100))
                 overall_deviations.append(anomaly_score)
 

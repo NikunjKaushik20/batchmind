@@ -7,10 +7,16 @@ import pandas as pd
 
 router = APIRouter(prefix="/api/batches", tags=["batches"])
 
+_batches_cache = None
+
 
 @router.get("")
 def list_batches():
-    """Return summary for all 60 batches."""
+    """Return summary for all 60 batches (cached after first call)."""
+    global _batches_cache
+    if _batches_cache is not None:
+        return _batches_cache
+
     batch_ids = get_all_batch_ids()
     summaries = []
     for bid in batch_ids:
@@ -19,6 +25,7 @@ def list_batches():
             summaries.append(s)
         except Exception as e:
             summaries.append({"Batch_ID": bid, "error": str(e)})
+    _batches_cache = summaries
     return summaries
 
 

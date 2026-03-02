@@ -1,7 +1,7 @@
 # ⚡ BatchMind — AI-Driven Manufacturing Intelligence
 
 > **Causal-Physics Hybrid Intelligence for Zero-Compromise Manufacturing**  
-> *IIT Hyderabad Hackathon — AI Manufacturing Track*
+> 
 
 ---
 
