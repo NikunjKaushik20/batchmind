@@ -23,6 +23,7 @@ import pandas as pd
 import logging
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="lightgbm")
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +182,7 @@ _pareto_F = None
 
 
 def _ensure_pareto():
+    _ensure_surrogates()
     global _pareto_X, _pareto_F, _pareto_cache
     if _pareto_X is None:
         logger.info("Running constrained NSGA-II Pareto optimization...")
@@ -296,10 +298,12 @@ def compute_golden_signature(objectives: dict, label: str = None) -> dict:
 
 
 def get_all_signatures() -> list:
+    _ensure_signatures()
     return list(_golden_signatures.values())
 
 
 def get_pareto_data() -> list:
+    _ensure_signatures()
     _ensure_pareto()
     df = _get_data()
     historical = [
@@ -429,19 +433,31 @@ def bayesian_update_from_feedback(sig_id: str, param_values: dict) -> dict:
     }
 
 
-# ─── INIT ────────────────────────────────────────────────────────────────────
-# Guard against re-execution in Uvicorn's reloader subprocess on Windows.
-# The spawn-based multiprocessing re-imports all modules in the child process;
-# without this guard, the heavy training code crashes the subprocess.
+# ─── LAZY INIT ───────────────────────────────────────────────────────────────
+# Train surrogates and compute signatures on first API call, not at import.
+# This works correctly with Uvicorn --reload on Windows.
 
-import multiprocessing as _mp
+_surrogates_ready = False
+init_signatures_done = False
 
-def _init_golden_signature():
-    global init_signatures_done
+
+def _ensure_surrogates():
+    """Lazy init: train LightGBM surrogates on first use."""
+    global _surrogates_ready
+    if _surrogates_ready:
+        return
     logger.info("Training surrogate models for NSGA-II...")
     _train_surrogates()
-    logger.info("Computing constrained NSGA-II Pareto front...")
-    init_signatures_done = False
+    _surrogates_ready = True
+    logger.info("Surrogate models ready.")
+
+
+def _ensure_signatures():
+    """Lazy init: compute default golden signatures on first use."""
+    global init_signatures_done
+    if init_signatures_done:
+        return
+    _ensure_surrogates()
     try:
         _ensure_pareto()
         compute_golden_signature({"quality": 1.0, "yield": 0, "energy": 0, "performance": 0}, "best_quality")
@@ -453,8 +469,3 @@ def _init_golden_signature():
         logger.warning(f"Signature init error: {e}")
     logger.info(f"✅ Golden Signature ready. {len(_bayesian_trackers)} Bayesian trackers active.")
 
-init_signatures_done = False
-
-# Only run init in the main process, not in Uvicorn's reloader child
-if _mp.current_process().name == "MainProcess":
-    _init_golden_signature()

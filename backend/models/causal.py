@@ -24,6 +24,7 @@ import warnings
 
 # Targeted suppression — only silence known noisy libraries, not all warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="lightgbm")
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 warnings.filterwarnings("ignore", category=FutureWarning, module="dowhy")
 warnings.filterwarnings("ignore", category=FutureWarning, module="shap")
 
@@ -233,6 +234,21 @@ def _engineer_features(df_in: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _fast_augment(x: np.ndarray) -> np.ndarray:
+    """Vectorized feature engineering — numpy-only, no DataFrame overhead.
+    Must produce features in the same order as _engineer_features().
+    Called thousands of times during NSGA-II; avoids DataFrame creation.
+    """
+    augmented = np.empty(12)
+    augmented[:7] = x
+    augmented[7] = x[2] * x[3]           # Thermal_Energy = Drying_Temp * Drying_Time
+    augmented[8] = x[1] / (x[0] + 1e-5)  # Binder_Rate = Binder_Amount / Granulation_Time
+    augmented[9] = x[4] * x[5]           # Compaction_Energy = Compression_Force * Machine_Speed
+    augmented[10] = x[4] ** 2            # Force_Squared
+    augmented[11] = x[5] ** 2            # Speed_Squared
+    return augmented
+
+
 # ─── LIGHTGBM SURROGATE MODELS (for NSGA-II speed) ───────────────────────────
 
 def _train_lgb_models():
@@ -356,11 +372,8 @@ def _predict(x: np.ndarray, target: str) -> float:
     For targets without physics models:
       prediction = ML(x)
     """
-    # Convert base vector 'x' to DataFrame to apply engineering
-    x_df = pd.DataFrame([x], columns=INPUT_PARAMS)
-    x_aug = _engineer_features(x_df)
-    
-    # Scale using the augment-aware scaler
+    # Fast numpy-only augmentation (no DataFrame overhead)
+    x_aug = _fast_augment(x).reshape(1, -1)
     x_scaled = _scaler.transform(x_aug)
     
     ml_pred = float(_lgb_models[target].predict(x_scaled)[0])
@@ -579,19 +592,10 @@ def _run_nsga2(weights: dict, n_gen: int = 80, pop_size: int = 50) -> tuple:
     pareto_F = result.F
 
     if pareto_X is None or len(pareto_X) == 0:
-        # Fallback if no feasible solution: relax constraints
-        problem_relaxed = ManufacturingProblem.__bases__[0].__new__(ManufacturingProblem)
-        ElementwiseProblem.__init__(problem_relaxed,
-            n_var=len(INPUT_PARAMS), n_obj=4, n_ieq_constr=0,
-            xl=_param_bounds["lower"], xu=_param_bounds["upper"])
-        problem_relaxed.weights = weights
-        problem_relaxed._evaluate = lambda self2, x, out, *a, **kw: out.__setitem__("F", [
-            -_predict(x, "Quality_Score"), -_predict(x, "Yield_Score"),
-            _predict(x, "Power_kWh"), _predict(x, "Disintegration_Time"),
-        ])
-        result = pymoo_minimize(problem, algorithm, termination, seed=42, verbose=False)
-        pareto_X = result.X if result.X is not None else np.array([_param_bounds["lower"]])
-        pareto_F = result.F if result.F is not None else np.zeros((1, 4))
+        # No feasible solution found — return center of parameter space as fallback
+        center = (_param_bounds["lower"] + _param_bounds["upper"]) / 2.0
+        pareto_X = center.reshape(1, -1)
+        pareto_F = np.zeros((1, 4))
 
     if pareto_X.ndim == 1:
         pareto_X = pareto_X.reshape(1, -1)
@@ -607,6 +611,9 @@ def _run_moead(weights: dict, n_gen: int = 80, pop_size: int = 50) -> tuple:
     MOEA/D decomposes the multi-objective problem into scalar subproblems
     using Tchebycheff scalarization. Each subproblem is optimized cooperatively.
 
+    Note: pymoo's MOEA/D does NOT support constraints, so we fold constraint
+    violations into objective penalties instead.
+
     Ref: Zhang & Li (2007), MOEA/D: A Multiobjective Evolutionary Algorithm
          Based on Decomposition, IEEE TEVC.
     """
@@ -615,7 +622,47 @@ def _run_moead(weights: dict, n_gen: int = 80, pop_size: int = 50) -> tuple:
 
     acm = get_constraint_manager()
     constraint_bounds = acm.get_nsga2_constraints()
-    problem = ManufacturingProblem(weights, constraint_bounds=constraint_bounds)
+
+    # Create an UNCONSTRAINED problem that folds constraints into penalties
+    class UnconstrainedManufacturingProblem(ElementwiseProblem):
+        def __init__(self):
+            lb = _param_bounds["lower"]
+            ub = _param_bounds["upper"]
+            super().__init__(
+                n_var=len(INPUT_PARAMS), n_obj=4,
+                n_ieq_constr=0,              # ← no constraints for MOEA/D
+                xl=lb, xu=ub,
+            )
+            cb = constraint_bounds or {}
+            self.c_hardness = cb.get("Hardness", 40.0)
+            self.c_friability = cb.get("Friability", 1.0)
+            self.c_dissolution = cb.get("Dissolution_Rate", 80.0)
+            self.c_disintegration = cb.get("Disintegration_Time", 15.0)
+
+        def _evaluate(self, x, out, *args, **kwargs):
+            quality = _predict(x, "Quality_Score")
+            yield_s = _predict(x, "Yield_Score")
+            energy = _predict(x, "Power_kWh")
+            disint = _predict(x, "Disintegration_Time")
+            hardness = _predict(x, "Hardness")
+            friability = _predict(x, "Friability")
+            dissolution = _predict(x, "Dissolution_Rate")
+
+            # Penalty for constraint violations (added to objectives)
+            penalty = 0.0
+            penalty += max(0, self.c_hardness - hardness)
+            penalty += max(0, friability - self.c_friability) * 100
+            penalty += max(0, self.c_dissolution - dissolution)
+            penalty += max(0, disint - self.c_disintegration) * 10
+
+            out["F"] = [
+                -quality + penalty,
+                -yield_s + penalty,
+                energy + penalty,
+                disint + penalty,
+            ]
+
+    problem = UnconstrainedManufacturingProblem()
 
     # Reference directions for 4 objectives
     try:
@@ -691,7 +738,8 @@ def _predict_with_uncertainty(x: np.ndarray, target: str,
 
     Returns dict with point prediction + both interval types.
     """
-    x_scaled = _scaler.transform(x.reshape(1, -1))
+    x_aug = _fast_augment(x).reshape(1, -1)
+    x_scaled = _scaler.transform(x_aug)
     mean_pred = float(_lgb_models[target].predict(x_scaled)[0])
 
     result = {
@@ -737,27 +785,38 @@ def _run_dual_optimization(weights: dict, n_gen: int = 80, pop_size: int = 50) -
     selects the algorithm that produces a higher-quality Pareto front
     for this specific optimization instance.
     """
-    # Run both algorithms
+    # Run NSGA-II (always)
     nsga2_X, nsga2_F = _run_nsga2(weights, n_gen, pop_size)
-    moead_X, moead_F = _run_moead(weights, n_gen, pop_size)
 
-    # Compute common reference point for fair comparison
-    all_F = np.vstack([nsga2_F, moead_F])
-    ref_point = all_F.max(axis=0) * 1.1
+    # Try MOEA/D but fall back gracefully to NSGA-II-only if it fails
+    winner = "NSGA-II"
+    best_X, best_F = nsga2_X, nsga2_F
+    hv_nsga2, hv_moead = 0.0, 0.0
+    moead_X = np.empty((0, len(INPUT_PARAMS)))  # default if MOEA/D fails
 
-    # Hypervolume comparison
-    hv_nsga2 = _compute_hypervolume(nsga2_F, ref_point)
-    hv_moead = _compute_hypervolume(moead_F, ref_point)
+    try:
+        moead_X, moead_F = _run_moead(weights, n_gen, pop_size)
 
-    logger.info(f"Hypervolume — NSGA-II: {hv_nsga2:.4f}, MOEA/D: {hv_moead:.4f}")
+        # Compute common reference point for fair comparison
+        all_F = np.vstack([nsga2_F, moead_F])
+        ref_point = all_F.max(axis=0) * 1.1
 
-    # Select winner
-    if hv_moead > hv_nsga2 * 1.01:  # MOEA/D must be >1% better to switch
-        winner = "MOEA/D"
-        best_X, best_F = moead_X, moead_F
-    else:
-        winner = "NSGA-II"
-        best_X, best_F = nsga2_X, nsga2_F
+        # Hypervolume comparison
+        hv_nsga2 = _compute_hypervolume(nsga2_F, ref_point)
+        hv_moead = _compute_hypervolume(moead_F, ref_point)
+
+        logger.info(f"Hypervolume — NSGA-II: {hv_nsga2:.4f}, MOEA/D: {hv_moead:.4f}")
+
+        # Select winner
+        if hv_moead > hv_nsga2 * 1.01:  # MOEA/D must be >1% better to switch
+            winner = "MOEA/D"
+            best_X, best_F = moead_X, moead_F
+        else:
+            best_X, best_F = nsga2_X, nsga2_F
+    except Exception as e:
+        logger.warning(f"MOEA/D failed ({e}), using NSGA-II only")
+        ref_point = nsga2_F.max(axis=0) * 1.1
+        hv_nsga2 = _compute_hypervolume(nsga2_F, ref_point)
 
     # Select best solution via weighted scalarization
     w_q = weights.get("quality", 0.25)
@@ -907,7 +966,7 @@ def causal_optimize(objectives: dict) -> dict:
     logger.info(f"Adaptive constraints: {active_constraints}")
 
     # STEP 2+3: Dual optimization (NSGA-II vs MOEA/D, hypervolume selection)
-    opt_result = _run_dual_optimization(objectives, n_gen=80, pop_size=50)
+    opt_result = _run_dual_optimization(objectives, n_gen=20, pop_size=20)
     optimal_x = opt_result["optimal_params"]
 
     # STEP 5: Validate with SCM interventional prediction
@@ -1020,7 +1079,7 @@ def counterfactual(batch_id: str) -> dict:
     # Find energy-minimizing parameters via NSGA-II
     nsga_X, nsga_F = _run_nsga2(
         {"quality": 0.1, "yield": 0.1, "energy": 0.7, "performance": 0.1},
-        n_gen=50, pop_size=30
+        n_gen=20, pop_size=20
     )
     # Select best energy solution (column 2 is energy, minimized)
     best_idx = nsga_F[:, 2].argmin() if len(nsga_F) > 0 else 0
@@ -1034,7 +1093,7 @@ def counterfactual(batch_id: str) -> dict:
     if optimal_quality < quality_threshold:
         nsga_X2, nsga_F2 = _run_nsga2(
             {"quality": 0.4, "yield": 0.1, "energy": 0.4, "performance": 0.1},
-            n_gen=60, pop_size=40
+            n_gen=20, pop_size=20
         )
         best_idx2 = nsga_F2[:, 2].argmin() if len(nsga_F2) > 0 else 0
         optimal_x = nsga_X2[best_idx2]

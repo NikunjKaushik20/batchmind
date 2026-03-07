@@ -102,6 +102,31 @@ def get_counterfactual(batch_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _run_counterfactual_background(job_id: str, batch_id: str):
+    """Execute counterfactual analysis in a background thread."""
+    try:
+        result = counterfactual(batch_id)
+        if not result:
+            with _job_lock:
+                _job_results[job_id] = {"status": "failed", "result": None, "error": f"Batch {batch_id} not found"}
+            return
+        with _job_lock:
+            _job_results[job_id] = {"status": "completed", "result": result, "error": None}
+    except Exception as e:
+        with _job_lock:
+            _job_results[job_id] = {"status": "failed", "result": None, "error": str(e)}
+
+
+@router.post("/counterfactual/async/{batch_id}")
+def counterfactual_async(batch_id: str):
+    """Submit counterfactual analysis as a background job. Returns job_id immediately."""
+    job_id = str(uuid.uuid4())[:8]
+    with _job_lock:
+        _job_results[job_id] = {"status": "running", "result": None, "error": None}
+    _executor.submit(_run_counterfactual_background, job_id, batch_id)
+    return {"job_id": job_id, "status": "submitted", "poll_url": f"/api/optimize/status/{job_id}"}
+
+
 @router.get("/explain/{batch_id}")
 def explain_counterfactual(batch_id: str):
     try:

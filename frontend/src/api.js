@@ -24,6 +24,8 @@ export const api = {
     // Optimizer
     optimize: (body) => req('/api/optimize', { method: 'POST', body: JSON.stringify(body) }),
     counterfactual: (id) => req(`/api/optimize/counterfactual/${id}`),
+    counterfactualAsync: (id) => req(`/api/optimize/counterfactual/async/${id}`, { method: 'POST' }),
+    jobStatus: (jobId) => req(`/api/optimize/status/${jobId}`),
     explain: (id) => req(`/api/optimize/explain/${id}`),
     getCausalGraph: () => req('/api/optimize/graph'),
     getImportance: () => req('/api/optimize/importance'),

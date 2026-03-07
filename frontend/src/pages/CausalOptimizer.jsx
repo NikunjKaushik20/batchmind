@@ -22,6 +22,7 @@ export default function CausalOptimizer() {
     const [importance, setImportance] = useState(null)
     const [loading, setLoading] = useState(false)
     const [cfId, setCfId] = useState('T001')
+    const [cfElapsed, setCfElapsed] = useState(0)
     const [cfLoading, setCfLoading] = useState(false)
     const [explainLoading, setExplainLoading] = useState(false)
 
@@ -40,12 +41,36 @@ export default function CausalOptimizer() {
 
     const handleCounterfactual = async () => {
         setCfLoading(true)
+        setCfElapsed(0)
         try {
-            const res = await api.counterfactual(cfId)
-            setCf(res)
-            setExplanation(null)
-        } catch (e) { console.error(e) }
-        setCfLoading(false)
+            const { job_id } = await api.counterfactualAsync(cfId)
+            const timer = setInterval(() => setCfElapsed(s => s + 3), 3000)
+            const poll = async () => {
+                try {
+                    const job = await api.jobStatus(job_id)
+                    if (job.status === 'completed') {
+                        clearInterval(timer)
+                        setCf(job.result)
+                        setExplanation(null)
+                        setCfLoading(false)
+                    } else if (job.status === 'failed') {
+                        clearInterval(timer)
+                        console.error('Counterfactual failed:', job.error)
+                        setCfLoading(false)
+                    } else {
+                        setTimeout(poll, 3000)
+                    }
+                } catch (e) {
+                    clearInterval(timer)
+                    console.error(e)
+                    setCfLoading(false)
+                }
+            }
+            setTimeout(poll, 3000)
+        } catch (e) {
+            console.error(e)
+            setCfLoading(false)
+        }
     }
 
     const handleExplain = async () => {
@@ -114,7 +139,7 @@ export default function CausalOptimizer() {
                         </select>
                         <button className="btn btn-secondary" style={{ width: '100%', justifyContent: 'center' }}
                             onClick={handleCounterfactual} disabled={cfLoading}>
-                            {cfLoading ? 'Analysing...' : '🔍 Analyse Counterfactual'}
+                            {cfLoading ? `Analysing... (${cfElapsed}s)` : '🔍 Analyse Counterfactual'}
                         </button>
                     </div>
                 </div>
@@ -131,11 +156,11 @@ export default function CausalOptimizer() {
                                         {result.confidence}
                                     </span>
                                 </div>
-                                <span className="badge badge-muted">Based on: {result.recommended_batch}</span>
+                                <span className="badge badge-muted">Based on: {result.reference_batch}</span>
                             </div>
 
                             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 10, marginBottom: 20 }}>
-                                {Object.entries(result.recommendations || {}).map(([param, val]) => (
+                                {Object.entries(result.recommended_params || {}).map(([param, val]) => (
                                     <div key={param} className="param-card">
                                         <div className="param-name">{param.replace(/_/g, ' ')}</div>
                                         <div className="param-value">{val.value?.toFixed(2)}</div>
