@@ -430,19 +430,31 @@ def bayesian_update_from_feedback(sig_id: str, param_values: dict) -> dict:
 
 
 # ─── INIT ────────────────────────────────────────────────────────────────────
+# Guard against re-execution in Uvicorn's reloader subprocess on Windows.
+# The spawn-based multiprocessing re-imports all modules in the child process;
+# without this guard, the heavy training code crashes the subprocess.
 
-logger.info("Training surrogate models for NSGA-II...")
-_train_surrogates()
-logger.info("Computing constrained NSGA-II Pareto front...")
+import multiprocessing as _mp
+
+def _init_golden_signature():
+    global init_signatures_done
+    logger.info("Training surrogate models for NSGA-II...")
+    _train_surrogates()
+    logger.info("Computing constrained NSGA-II Pareto front...")
+    init_signatures_done = False
+    try:
+        _ensure_pareto()
+        compute_golden_signature({"quality": 1.0, "yield": 0, "energy": 0, "performance": 0}, "best_quality")
+        compute_golden_signature({"quality": 0, "yield": 0, "energy": 1.0, "performance": 0}, "best_energy")
+        compute_golden_signature({"quality": 0.4, "yield": 0.3, "energy": 0.2, "performance": 0.1}, "balanced")
+        compute_golden_signature({"quality": 0.3, "yield": 0.3, "energy": 0.3, "performance": 0.1}, "sustainability")
+        init_signatures_done = True
+    except Exception as e:
+        logger.warning(f"Signature init error: {e}")
+    logger.info(f"✅ Golden Signature ready. {len(_bayesian_trackers)} Bayesian trackers active.")
+
 init_signatures_done = False
-try:
-    _ensure_pareto()
-    compute_golden_signature({"quality": 1.0, "yield": 0, "energy": 0, "performance": 0}, "best_quality")
-    compute_golden_signature({"quality": 0, "yield": 0, "energy": 1.0, "performance": 0}, "best_energy")
-    compute_golden_signature({"quality": 0.4, "yield": 0.3, "energy": 0.2, "performance": 0.1}, "balanced")
-    compute_golden_signature({"quality": 0.3, "yield": 0.3, "energy": 0.3, "performance": 0.1}, "sustainability")
-    init_signatures_done = True
-except Exception as e:
-    logger.warning(f"Signature init error: {e}")
 
-logger.info(f"✅ Golden Signature ready. {len(_bayesian_trackers)} Bayesian trackers active.")
+# Only run init in the main process, not in Uvicorn's reloader child
+if _mp.current_process().name == "MainProcess":
+    _init_golden_signature()

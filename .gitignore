@@ -8,8 +8,6 @@
 # Backend
 backend/__pycache__/
 backend/*.pyc
-backend/...
-backend/data/
 
 # Frontend
 frontend/node_modules/
