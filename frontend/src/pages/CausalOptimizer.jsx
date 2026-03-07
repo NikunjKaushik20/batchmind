@@ -24,6 +24,7 @@ export default function CausalOptimizer() {
     const [cfId, setCfId] = useState('T001')
     const [cfElapsed, setCfElapsed] = useState(0)
     const [cfLoading, setCfLoading] = useState(false)
+    const [cfError, setCfError] = useState(null)
     const [explainLoading, setExplainLoading] = useState(false)
 
     useEffect(() => {
@@ -42,28 +43,48 @@ export default function CausalOptimizer() {
     const handleCounterfactual = async () => {
         setCfLoading(true)
         setCfElapsed(0)
+        setCfError(null)
+        setCf(null)
         try {
             const { job_id } = await api.counterfactualAsync(cfId)
+
+            // Polling: retry on network errors, timeout after 40 polls (120s)
+            let pollCount = 0
+            const MAX_POLLS = 40
+
             const timer = setInterval(() => setCfElapsed(s => s + 3), 3000)
+
             const poll = async () => {
+                pollCount++
+                if (pollCount > MAX_POLLS) {
+                    clearInterval(timer)
+                    setCfError('Analysis timed out (>120s). Try again — the server may still be warming up.')
+                    setCfLoading(false)
+                    return
+                }
                 try {
                     const job = await api.jobStatus(job_id)
                     if (job.status === 'completed') {
                         clearInterval(timer)
-                        setCf(job.result)
-                        setExplanation(null)
+                        if (job.result) {
+                            setCf(job.result)
+                            setExplanation(null)
+                        } else {
+                            console.error('Counterfactual returned empty result')
+                        }
                         setCfLoading(false)
                     } else if (job.status === 'failed') {
                         clearInterval(timer)
-                        console.error('Counterfactual failed:', job.error)
+                        setCfError(`Analysis failed: ${job.error || 'unknown error'}`)
                         setCfLoading(false)
                     } else {
+                        // Still running — keep polling
                         setTimeout(poll, 3000)
                     }
                 } catch (e) {
-                    clearInterval(timer)
-                    console.error(e)
-                    setCfLoading(false)
+                    // Network hiccup — retry instead of aborting
+                    console.warn('Poll error (retrying):', e.message)
+                    setTimeout(poll, 3000)
                 }
             }
             setTimeout(poll, 3000)
@@ -139,8 +160,18 @@ export default function CausalOptimizer() {
                         </select>
                         <button className="btn btn-secondary" style={{ width: '100%', justifyContent: 'center' }}
                             onClick={handleCounterfactual} disabled={cfLoading}>
-                            {cfLoading ? `Analysing... (${cfElapsed}s)` : '🔍 Analyse Counterfactual'}
+                            {cfLoading ? `⏳ Analysing... (${cfElapsed}s)` : '🔍 Analyse Counterfactual'}
                         </button>
+                        {cfLoading && (
+                            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 8, textAlign: 'center' }}>
+                                Running NSGA-II causal optimization — typically 15-30 sec
+                            </div>
+                        )}
+                        {cfError && (
+                            <div style={{ marginTop: 8, padding: '10px 14px', background: 'var(--danger-bg)', borderRadius: 8, fontSize: 12, color: 'var(--danger)' }}>
+                                ⚠️ {cfError}
+                            </div>
+                        )}
                     </div>
                 </div>
 

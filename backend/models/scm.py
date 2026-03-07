@@ -303,9 +303,13 @@ class StructuralCausalModel:
                     unit_noise[node] = 0.0
 
         # Get observed values for this unit
+        # Note: skip non-numeric columns (e.g. Batch_ID) — only DAG-relevant floats needed
         observed = {}
         for col in self.data.columns:
-            observed[col] = float(self.data.iloc[observation_idx][col])
+            try:
+                observed[col] = float(self.data.iloc[observation_idx][col])
+            except (ValueError, TypeError):
+                pass  # skip string/categorical columns like Batch_ID
 
         # Step 2 + 3: Action + Prediction
         cf_values = {}
