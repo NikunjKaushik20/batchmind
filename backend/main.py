@@ -84,4 +84,18 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    from models.causal import _initialized as causal_ready
+    from models.golden_signature import init_signatures_done as golden_ready
+    return {
+        "status": "ok",
+        "causal_engine_ready": causal_ready,
+        "golden_signature_ready": golden_ready,
+    }
+
+
+@app.on_event("startup")
+async def on_startup():
+    logger.info("[BatchMind] 🚀 Server started. Background warm-up threads running in parallel.")
+    logger.info("[BatchMind] ⏳ causal-core-init: training LightGBM + SCM (~30-60s)")
+    
+    logger.info("[BatchMind] ⏳ golden-init: NSGA-II Pareto optimization (~30-45s)")

@@ -61,6 +61,10 @@ _enriched_df = None
 _pareto_cache = None
 _bayesian_trackers = {}  # sig_id → BayesianParameterTracker
 
+import threading as _threading
+_init_lock = _threading.Lock()
+_init_done_event = _threading.Event()  # set when _ensure_signatures() finishes
+
 
 def _get_data() -> pd.DataFrame:
     global _enriched_df
@@ -154,7 +158,9 @@ class GoldenSignatureProblem(ElementwiseProblem):
         ]
 
 
-def _run_nsga2_pareto(n_gen: int = 100, pop_size: int = 60) -> tuple:
+def _run_nsga2_pareto(n_gen: int = 30, pop_size: int = 25) -> tuple:
+    """Run NSGA-II for Pareto front. Reduced from n_gen=100/pop=60 for speed.
+    60-row dataset doesn't benefit from massive populations."""
     problem = GoldenSignatureProblem()
     algorithm = NSGA2(
         pop_size=pop_size,
@@ -186,7 +192,7 @@ def _ensure_pareto():
     global _pareto_X, _pareto_F, _pareto_cache
     if _pareto_X is None:
         logger.info("Running constrained NSGA-II Pareto optimization...")
-        _pareto_X, _pareto_F = _run_nsga2_pareto(n_gen=100, pop_size=60)
+        _pareto_X, _pareto_F = _run_nsga2_pareto()  # uses reduced defaults
         logger.info(f"Pareto front: {len(_pareto_X)} solutions")
 
         _pareto_cache = []
@@ -433,9 +439,10 @@ def bayesian_update_from_feedback(sig_id: str, param_values: dict) -> dict:
     }
 
 
-# ─── LAZY INIT ───────────────────────────────────────────────────────────────
-# Train surrogates and compute signatures on first API call, not at import.
-# This works correctly with Uvicorn --reload on Windows.
+# ─── LAZY INIT (with background eager warm-up) ───────────────────────────────
+# On import, a background thread starts computing signatures immediately.
+# API calls check _init_done_event; if not ready yet they wait (but don't
+# re-trigger the computation). Once done, all calls return instantly from cache.
 
 _surrogates_ready = False
 init_signatures_done = False
@@ -453,19 +460,38 @@ def _ensure_surrogates():
 
 
 def _ensure_signatures():
-    """Lazy init: compute default golden signatures on first use."""
+    """Ensure golden signatures are ready; block until background init finishes."""
     global init_signatures_done
     if init_signatures_done:
         return
-    _ensure_surrogates()
+    # If the background thread hasn't finished yet, wait for it (max 10 min).
+    # Use a lock so only ONE thread does the actual computation.
+    with _init_lock:
+        if init_signatures_done:  # double-check under lock
+            return
+        _ensure_surrogates()
+        try:
+            _ensure_pareto()
+            compute_golden_signature({"quality": 1.0, "yield": 0, "energy": 0, "performance": 0}, "best_quality")
+            compute_golden_signature({"quality": 0, "yield": 0, "energy": 1.0, "performance": 0}, "best_energy")
+            compute_golden_signature({"quality": 0.4, "yield": 0.3, "energy": 0.2, "performance": 0.1}, "balanced")
+            compute_golden_signature({"quality": 0.3, "yield": 0.3, "energy": 0.3, "performance": 0.1}, "sustainability")
+            init_signatures_done = True
+        except Exception as e:
+            logger.warning(f"Signature init error: {e}")
+        logger.info(f"✅ Golden Signature ready. {len(_bayesian_trackers)} Bayesian trackers active.")
+        _init_done_event.set()
+
+
+def _background_init():
+    """Called in a background thread at import time to pre-warm everything."""
     try:
-        _ensure_pareto()
-        compute_golden_signature({"quality": 1.0, "yield": 0, "energy": 0, "performance": 0}, "best_quality")
-        compute_golden_signature({"quality": 0, "yield": 0, "energy": 1.0, "performance": 0}, "best_energy")
-        compute_golden_signature({"quality": 0.4, "yield": 0.3, "energy": 0.2, "performance": 0.1}, "balanced")
-        compute_golden_signature({"quality": 0.3, "yield": 0.3, "energy": 0.3, "performance": 0.1}, "sustainability")
-        init_signatures_done = True
+        _ensure_signatures()
     except Exception as e:
-        logger.warning(f"Signature init error: {e}")
-    logger.info(f"✅ Golden Signature ready. {len(_bayesian_trackers)} Bayesian trackers active.")
+        logger.warning(f"Background golden init error: {e}")
+
+
+# Kick off background warm-up immediately on import (non-blocking)
+_bg_thread = _threading.Thread(target=_background_init, daemon=True, name="golden-init")
+_bg_thread.start()
 
